@@ -195,7 +195,7 @@ class DrcomGUI:
 
 
     def _start_auth(self):
-        self._save # 保存
+        self._save(self) # 保存
         """启动认证（在后台线程中运行）"""
         if self.running:
             return
