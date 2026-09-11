@@ -13,11 +13,40 @@ import json
 import uuid
 
 # CONFIG
-with open("user_profile.json", "r", encoding="utf-8") as f:
-    data = json.load(f)
+def _application_directory():
+    """Return the directory beside the script or packaged executable."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+PROFILE_PATH = os.path.join(_application_directory(), "user_profile.json")
+
+
+def load_profile():
+    """Read the optional saved profile without creating a file."""
+    if not os.path.isfile(PROFILE_PATH):
+        return {}
+
+    try:
+        with open(PROFILE_PATH, "r", encoding="utf-8") as f:
+            profile = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    return profile if isinstance(profile, dict) else {}
+
+
+def has_saved_credentials():
+    """Whether a usable account and password have been saved."""
+    profile = load_profile()
+    return bool(profile.get("username") and profile.get("password"))
+
+
+data = load_profile()
 server = "192.168.255.249"
-username = data["username"]
-password = data["password"]
+username = str(data.get("username") or "")
+password = str(data.get("password") or "")
 host_name = "LIYUANYUAN"
 host_os = "8089D"
 host_ip = "10.53.1.224"
@@ -468,6 +497,9 @@ def init_socket():
 
 def main():
     global s
+    if not has_saved_credentials():
+        print("未找到有效的 user_profile.json，未执行认证。请先通过 GUI 保存账号信息。")
+        return
     if s is None:
         init_socket()
     if not IS_TEST:

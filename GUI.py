@@ -5,25 +5,36 @@
 """
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, messagebox
 import threading
 import time
 import queue
 import sys
 import os
 import json
-# 判断配置文件是否存在
-if not os.path.isfile("user_profile.json"): # 判断配置文件是否存在
-    default_data = {
-        "username": "",
-        "password": ""
-    }
-    with open("user_profile.json", "w", encoding="utf-8") as f:
-        json.dump(default_data, f, ensure_ascii=False, indent=4)
+import subprocess
 
 # 导入核心认证模块
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import Authentication as drcom
+
+
+AUTO_START_ARGUMENT = "--autostart"
+RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE_NAME = "XSYUCampusNetworkAuth"
+
+
+def startup_command():
+    """Build the command Windows should run after a user signs in."""
+    if getattr(sys, "frozen", False):
+        command_parts = [os.path.abspath(sys.executable), AUTO_START_ARGUMENT]
+    else:
+        command_parts = [
+            os.path.abspath(sys.executable),
+            os.path.abspath(__file__),
+            AUTO_START_ARGUMENT,
+        ]
+    return subprocess.list2cmdline(command_parts)
 
 
 class DrcomGUI:
@@ -46,6 +57,8 @@ class DrcomGUI:
         self.running = False
         self.auth_thread = None
         self.log_queue = queue.Queue()
+        self.auto_start_requested = AUTO_START_ARGUMENT in sys.argv
+        self.log_redirected = False
 
         # 构建界面
         self._build_ui()
@@ -55,6 +68,11 @@ class DrcomGUI:
 
         # 窗口关闭事件
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # 只有 Windows 登录时由注册表传入 --autostart 才自动认证。
+        # 手动双击程序始终只打开界面，避免意外发起认证。
+        if self.auto_start_requested:
+            self.root.after(500, self._start_saved_profile_on_boot)
 
     def _build_ui(self):
         """构建界面布局"""
@@ -82,6 +100,19 @@ class DrcomGUI:
         ttk.Label(config_frame, text="密码:").grid(row=1, column=2, sticky=tk.W, padx=(10, 5), pady=3)
         self.password_var = tk.StringVar(value=drcom.password)
         ttk.Entry(config_frame, textvariable=self.password_var, width=18, show="*").grid(row=1, column=3, sticky=tk.EW, pady=3)
+
+        # Windows 登录后启动程序并自动认证的开关。
+        self.startup_var = tk.BooleanVar(value=self._is_startup_enabled())
+        self.startup_check = ttk.Checkbutton(
+            config_frame,
+            text="开机自启动（登录 Windows 后自动认证）",
+            variable=self.startup_var,
+            command=self._toggle_startup,
+        )
+        self.startup_check.grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(8, 0))
+
+        if os.name != "nt":
+            self.startup_check.config(state=tk.DISABLED)
 
         # ========== 操作按钮区域 ==========
         
@@ -132,6 +163,75 @@ class DrcomGUI:
         # 清空日志按钮
         ttk.Button(footer_frame, text="清空日志", command=self._clear_log, width=10).pack(side=tk.RIGHT)
 
+    def _is_startup_enabled(self):
+        """Return whether this application's Windows startup entry exists."""
+        if os.name != "nt":
+            return False
+
+        try:
+            import winreg
+
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH) as key:
+                winreg.QueryValueEx(key, RUN_VALUE_NAME)
+            return True
+        except (FileNotFoundError, OSError):
+            return False
+
+    def _toggle_startup(self):
+        """Create or remove the per-user Windows startup registry entry."""
+        enabled = self.startup_var.get()
+        if os.name != "nt":
+            self.startup_var.set(False)
+            return
+
+        try:
+            import winreg
+
+            with winreg.CreateKeyEx(
+                winreg.HKEY_CURRENT_USER,
+                RUN_KEY_PATH,
+                0,
+                winreg.KEY_SET_VALUE,
+            ) as key:
+                if enabled:
+                    winreg.SetValueEx(
+                        key,
+                        RUN_VALUE_NAME,
+                        0,
+                        winreg.REG_SZ,
+                        startup_command(),
+                    )
+                else:
+                    try:
+                        winreg.DeleteValue(key, RUN_VALUE_NAME)
+                    except FileNotFoundError:
+                        pass
+        except OSError as exc:
+            self.startup_var.set(not enabled)
+            messagebox.showerror("设置失败", f"无法更新开机自启动设置：\n{exc}", parent=self.root)
+            return
+
+        if enabled:
+            self._log("[设置] 已开启开机自启动；下次登录 Windows 时将显示界面并自动认证。", "success")
+        else:
+            self._log("[设置] 已关闭开机自启动。", "info")
+
+    def _has_credentials(self):
+        return bool(self.username_var.get().strip() and self.password_var.get())
+
+    def _start_saved_profile_on_boot(self):
+        """Auto-authenticate only when a previously saved profile is available."""
+        if not os.path.isfile(drcom.PROFILE_PATH):
+            self._log("[开机启动] 未找到 user_profile.json，未执行认证。", "warn")
+            return
+
+        if not self._has_credentials():
+            self._log("[开机启动] 保存的信息不完整，未执行认证。", "warn")
+            return
+
+        self._log("[开机启动] 已读取保存的信息，正在自动开始认证。", "info")
+        self._start_auth(save_profile=False)
+
     def _log(self, message, tag=None):
         """添加日志到队列（线程安全）"""
         self.log_queue.put((message, tag))
@@ -155,14 +255,23 @@ class DrcomGUI:
         """更新状态显示"""
         self.status_label.config(text=text, foreground=color)
 
-    def _save(self):
-        """保存数据"""
+    def _save(self, show_feedback=True):
+        """Save account information next to the script or packaged executable."""
         profile = {
-            "username":self.username_var.get(),
-            "password":self.password_var.get()
+            "username": self.username_var.get().strip(),
+            "password": self.password_var.get(),
         }
-        with open("user_profile.json", "w", encoding="utf-8") as f:
-            json.dump(profile, f, ensure_ascii=False, indent=4)
+        try:
+            with open(drcom.PROFILE_PATH, "w", encoding="utf-8") as f:
+                json.dump(profile, f, ensure_ascii=False, indent=4)
+        except OSError as exc:
+            messagebox.showerror("保存失败", f"无法保存账号信息：\n{exc}", parent=self.root)
+            return False
+
+        self._apply_config()
+        if show_feedback:
+            self._log("[设置] 账号信息已保存。", "success")
+        return True
 
     def _apply_config(self):
         """将界面配置应用到核心模块"""
@@ -171,7 +280,8 @@ class DrcomGUI:
 
     def _redirect_log(self):
         """重定向 drcom 模块的 log 到 GUI"""
-        original_log = drcom.log
+        if self.log_redirected:
+            return
 
         def gui_log(*args, **kwargs):
             s = " ".join(args)
@@ -188,16 +298,22 @@ class DrcomGUI:
             timestamp = time.strftime("%H:%M:%S")
             self._log(f"[{timestamp}] {s}", tag)
 
-            # 同时调用原始 log
-            original_log(*args, **kwargs)
-
         drcom.log = gui_log
+        self.log_redirected = True
 
 
-    def _start_auth(self):
-        self._save(self) # 保存
+    def _start_auth(self, save_profile=True):
         """启动认证（在后台线程中运行）"""
         if self.running:
+            return
+
+        if not self._has_credentials():
+            self._log("[错误] 请先填写用户名和密码。", "error")
+            messagebox.showwarning("无法认证", "请先填写用户名和密码。", parent=self.root)
+            return
+
+        # 手动认证会保存信息；开机认证只使用已有的 JSON，不会创建新文件。
+        if save_profile and not self._save(show_feedback=False):
             return
 
         # 应用配置
